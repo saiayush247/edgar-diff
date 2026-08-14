@@ -160,7 +160,8 @@ class EdgarClient:
 
         filings = []
         for form, acc, fdate, pdoc in zip(all_forms, all_accessions, all_filing_dates, all_primary_docs):
-            if form != "10-K":
+            # Include standard 10-K and amended 10-K/A if needed
+            if not form.startswith("10-K"):
                 continue
             try:
                 fy = int(fdate.split("-")[0]) - 1
@@ -181,6 +182,7 @@ class EdgarClient:
         for f in sorted(filings, key=lambda x: x.filing_date):
             seen_years[f.fiscal_year] = f
 
+        logger.info("Fetched %d valid 10-K filings for ticker %s", len(seen_years), ticker)
         return list(seen_years.values())
 
     def download_filing_text(self, url: str) -> str:
@@ -200,30 +202,15 @@ def parse_company_tickers(data: dict) -> Dict[str, str]:
 def extract_item_1a(html_content: str) -> Optional[str]:
     """Extract the Item 1A (Risk Factors) section from a 10-K.
 
-    10-Ks contain the string "Item 1A" at least twice: once in the Table of
-    Contents and once at the actual section heading. A naive "first match"
-    approach grabs the Table of Contents entry, then extracts everything
-    between that point and Item 1B/2, which mixes in the rest of the TOC
-    and the entire Item 1 Business section. That corrupts every downstream
-    similarity score.
-
-    To disambiguate, every "Item 1A" candidate is scored by how much text
-    sits between it and the next "Item 1B" / "Item 2" marker. A Table of
-    Contents entry is immediately followed by more short TOC lines, so the
-    gap to the next item marker is small. The real section is followed by
-    the actual risk factors prose, so the gap is large. The candidate with
-    the largest gap is taken as the real section.
-
-    Large filers commonly space out headings with HTML entities instead of
-    literal spaces, e.g. "Item&#160;1A." (a non-breaking space entity). If
-    entities aren't decoded first, "\\s*" in the patterns below sees no
-    whitespace between "Item" and "1A" and the match silently fails on
-    every filing from that company. html.unescape() converts entities like
-    &#160; and &nbsp; back into real whitespace characters before matching.
+    Handles HTML entities, table of contents filtering, and robust gap heuristics
+    to prevent false positives from stray late-document references.
     """
     clean_text = html.unescape(html_content)
     clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
     clean_text = re.sub(r'\s+', ' ', clean_text)
+
+    # Ignore the first 15% of the document to completely bypass Table of Contents
+    toc_cutoff = int(len(clean_text) * 0.15)
 
     start_patterns = [
         r'item\s*1a\.?\s*risk\s*factors',
@@ -234,10 +221,17 @@ def extract_item_1a(html_content: str) -> Optional[str]:
         r'item\s*2\.?\s*properties'
     ]
 
-    start_positions = set()
+    start_positions = []
     for pattern in start_patterns:
         for m in re.finditer(pattern, clean_text, re.IGNORECASE):
-            start_positions.add(m.start())
+            if m.start() > toc_cutoff:  # Enforce post-TOC restriction
+                start_positions.append(m.start())
+
+    if not start_positions:
+        # Fallback to full text search if cutoff was too aggressive
+        for pattern in start_patterns:
+            for m in re.finditer(pattern, clean_text, re.IGNORECASE):
+                start_positions.append(m.start())
 
     if not start_positions:
         return None
@@ -245,7 +239,7 @@ def extract_item_1a(html_content: str) -> Optional[str]:
     MAX_SECTION_LEN = 150000
     best_start, best_end, best_gap = None, None, -1
 
-    for pos in sorted(start_positions):
+    for pos in sorted(set(start_positions)):
         end_pos = None
         for pattern in end_patterns:
             matches = list(re.finditer(pattern, clean_text[pos:], re.IGNORECASE))
@@ -255,22 +249,15 @@ def extract_item_1a(html_content: str) -> Optional[str]:
                     end_pos = candidate_end
 
         if end_pos is None:
-            # No end marker found after this candidate at all, treat as a
-            # weak candidate rather than assuming it spans to end of doc.
             continue
 
         gap = end_pos - pos
-        if gap > best_gap:
+        # Prevent runaway gaps caused by stray late markers
+        if 500 < gap < MAX_SECTION_LEN and gap > best_gap:
             best_start, best_end, best_gap = pos, end_pos, gap
 
-    if best_start is None:
-        # Fall back: take the last start candidate (real section tends to
-        # come after the TOC entry) with a fixed window.
-        pos = sorted(start_positions)[-1]
-        best_start, best_end = pos, pos + MAX_SECTION_LEN
-
-    if best_end - best_start > MAX_SECTION_LEN:
-        best_end = best_start + MAX_SECTION_LEN
+    if best_start is None or best_end is None:
+        return None
 
     extracted = clean_text[best_start:best_end].strip()
     if len(extracted) < 500:
@@ -280,14 +267,7 @@ def extract_item_1a(html_content: str) -> Optional[str]:
 
 
 def year_over_year_similarity(prev_vec, curr_vec, prev_text: str, curr_text: str) -> dict:
-    """Compute change metrics between two firm-year documents.
-
-    Cosine similarity uses TF-IDF vectors that were fit on the full corpus
-    of extracted texts across all firm-years in the run, not just this one
-    pair. Fitting per pair, on only two documents, makes IDF weighting
-    nearly meaningless, since a term's document frequency can only be 1 or
-    2 out of 2. Corpus-level fitting gives the weighting real signal.
-    """
+    """Compute change metrics between two firm-year documents."""
     sim = cosine_similarity(prev_vec, curr_vec)[0][0]
 
     prev_tokens = set(prev_text.lower().split())
@@ -329,7 +309,7 @@ def build_panel(
 
         for f in filings:
             try:
-                html = client.download_filing_text(f.document_url)
+                html_data = client.download_filing_text(f.document_url)
             except Exception as e:
                 stats.filings_download_failed.append((ticker, f.fiscal_year, str(e)))
                 logger.warning(
@@ -337,7 +317,7 @@ def build_panel(
                 )
                 continue
 
-            text = extract_item_1a(html)
+            text = extract_item_1a(html_data)
             if text:
                 extracted_texts[(ticker, f.fiscal_year)] = text
                 stats.firm_years_extracted += 1
