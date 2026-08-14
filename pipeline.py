@@ -43,7 +43,14 @@ class RunStats:
     filings_extraction_failed: List[Tuple[str, int, str]] = field(default_factory=list)
     filings_download_failed: List[Tuple[str, int, str]] = field(default_factory=list)
     firm_years_extracted: int = 0
+    firm_years_low_confidence: List[Tuple[str, int, str]] = field(default_factory=list)
     panel_rows_built: int = 0
+    panel_rows_flagged: int = 0
+    # Per-ticker funnel: cik found -> filings found -> downloaded ->
+    # extracted (high/low confidence) -> failed. Makes it possible to see
+    # exactly which stage a ticker dropped out at, instead of it just
+    # being absent from the final panel with no trace of why.
+    ticker_diagnostics: Dict[str, dict] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
@@ -53,7 +60,10 @@ class RunStats:
             "filings_extraction_failed": self.filings_extraction_failed,
             "filings_download_failed": self.filings_download_failed,
             "firm_years_extracted": self.firm_years_extracted,
+            "firm_years_low_confidence": self.firm_years_low_confidence,
             "panel_rows_built": self.panel_rows_built,
+            "panel_rows_flagged": self.panel_rows_flagged,
+            "ticker_diagnostics": self.ticker_diagnostics,
         }
 
 
@@ -177,7 +187,8 @@ class EdgarClient:
             # Part III and don't carry a full Item 1A. If you later want to
             # accept NT 10-K or 10-K405 explicitly, add them here rather than
             # loosening back to startswith.
-            if form != "10-K":
+            form_clean = (form or "").strip()
+            if form_clean != "10-K":
                 continue
 
             fy = None
@@ -187,13 +198,17 @@ class EdgarClient:
                 except Exception:
                     fy = None
             if fy is None:
-                # Fallback only when SEC didn't give us a reportDate at all.
-                # This is the old (wrong for MSFT/WMT-style fiscal calendars)
-                # heuristic — kept only as a last resort, not the default path.
                 try:
                     fy = int(fdate.split("-")[0]) - 1
                 except Exception:
                     continue
+
+            if not pdoc:
+                logger.warning(
+                    "Skipping %s filing dated %s: no primaryDocument in submissions JSON.",
+                    ticker, fdate,
+                )
+                continue
 
             acc_no_hyphen = acc.replace("-", "")
             doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_hyphen}/{pdoc}"
@@ -226,43 +241,51 @@ def parse_company_tickers(data: dict) -> Dict[str, str]:
     return mapping
 
 
-def extract_item_1a(html_content: str) -> Optional[str]:
-    """Extract the Item 1A (Risk Factors) section from a 10-K.
+from dataclasses import dataclass as _dc
 
-    Handles HTML entities, table of contents filtering for large filers like MSFT,
-    and robust gap heuristics to prevent false positives.
-    """
-    clean_text = html.unescape(html_content)
-    clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
-    clean_text = re.sub(r'\s+', ' ', clean_text)
 
-    start_patterns = [
-        r'item\s*1a\.?\s*risk\s*factors',
-        r'item\s*1a\b'
-    ]
+@_dc
+class ExtractionResult:
+    text: Optional[str]
+    confidence: str   # "high", "low", "none"
+    method: str        # "matched", "matched_short", "fallback", "none"
+    char_len: int
+
+
+# Real Item 1A sections run many pages of prose. A "match" shorter than this
+# is treated as unconfirmed rather than accepted outright — this is the bar
+# that catches the MSFT-style bug where a compact TOC/index row produced a
+# small, tight, technically-valid gap.
+MIN_CONFIDENT_LEN = 3000
+MIN_ACCEPTABLE_LEN = 500
+MAX_SECTION_LEN = 400000
+_TOC_DENSITY_WINDOW = 1000
+_TOC_DENSITY_MAX_HITS = 2
+
+
+def _looks_like_toc(window_text: str) -> bool:
+    """A real Item 1A section is prose about risks — it rarely mentions
+    'Item N' more than once or twice. A compact TOC or index listing (e.g.
+    'Item 1A ... Item 1B ... Item 2 ...' packed into a few hundred
+    characters) mentions several in quick succession. Check only the head
+    of the window since TOC-style clustering, if present, shows up
+    immediately at the start of a false-positive match."""
+    head = window_text[:2000]
+    hits = len(re.findall(r'item\s*\d+[ab]?\b', head, re.IGNORECASE))
+    density = hits / max(len(head) / _TOC_DENSITY_WINDOW, 1e-6)
+    return density > _TOC_DENSITY_MAX_HITS
+
+
+def _find_best_gap(
+    clean_text: str, start_positions: List[int], doc_len: int, min_len: int, require_toc_guard: bool
+) -> Tuple[Optional[int], Optional[int]]:
     end_patterns = [
         r'item\s*1b\.?\s*unresolved',
         r'item\s*2\.?\s*properties'
     ]
-
-    start_positions = []
-    for pattern in start_patterns:
-        for m in re.finditer(pattern, clean_text, re.IGNORECASE):
-            start_positions.append(m.start())
-
-    if not start_positions:
-        return None
-
-    # JPM-scale filers routinely have Item 1A sections that clean to well
-    # over 150k characters (credit/regulatory risk disclosure runs long).
-    # 150k was silently forcing the biggest filers into the unfiltered
-    # fallback path. 400k gives real headroom without being unbounded.
-    MAX_SECTION_LEN = 400000
     best_start, best_end, best_gap = None, None, None
-    doc_len = len(clean_text)
 
-    for pos in sorted(set(start_positions)):
-        # Skip early occurrences if they are clustered in the Table of Contents preamble
+    for pos in start_positions:
         if len(start_positions) > 3 and pos < doc_len * 0.20:
             continue
 
@@ -278,23 +301,77 @@ def extract_item_1a(html_content: str) -> Optional[str]:
             continue
 
         gap = end_pos - pos
-        if 500 < gap < MAX_SECTION_LEN and (best_gap is None or gap < best_gap):
+        if not (min_len < gap < MAX_SECTION_LEN):
+            continue
+
+        if require_toc_guard and _looks_like_toc(clean_text[pos:end_pos]):
+            continue
+
+        if best_gap is None or gap < best_gap:
             best_start, best_end, best_gap = pos, end_pos, gap
 
-    # Fallback if strict filtering dropped everything
-    if best_start is None and start_positions:
-        pos = start_positions[-1]
-        best_start = pos
-        best_end = min(pos + MAX_SECTION_LEN, doc_len)
+    return best_start, best_end
 
-    if best_start is None or best_end is None:
-        return None
 
-    extracted = clean_text[best_start:best_end].strip()
-    if len(extracted) < 500:
-        return None
+def extract_item_1a_detailed(html_content: str) -> ExtractionResult:
+    """Extract the Item 1A (Risk Factors) section from a 10-K, tagged with
+    a confidence level instead of a binary hit/miss.
 
-    return extracted
+    Three tiers, tried in order:
+    1. "high" — passes the TOC-density guard and clears MIN_CONFIDENT_LEN
+       (thousands of chars). This is what a real Item 1A section looks like.
+    2. "low"/"matched_short" — same anchors, but the density guard is
+       dropped or the length only clears MIN_ACCEPTABLE_LEN. Structurally
+       plausible but short enough to warrant a second look before trusting
+       it in an analysis.
+    3. "low"/"fallback" — no confirmed end anchor at all; slice forward
+       from the last start match. Least reliable path in the function.
+    """
+    clean_text = html.unescape(html_content)
+    clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    doc_len = len(clean_text)
+
+    start_patterns = [
+        r'item\s*1a\.?\s*risk\s*factors',
+        r'item\s*1a\b'
+    ]
+    start_positions = []
+    for pattern in start_patterns:
+        for m in re.finditer(pattern, clean_text, re.IGNORECASE):
+            start_positions.append(m.start())
+    start_positions = sorted(set(start_positions))
+
+    if not start_positions:
+        return ExtractionResult(None, "none", "none", 0)
+
+    # Tier 1: confident match — long enough, and not TOC-shaped.
+    start, end = _find_best_gap(clean_text, start_positions, doc_len, MIN_CONFIDENT_LEN, require_toc_guard=True)
+    if start is not None:
+        extracted = clean_text[start:end].strip()
+        return ExtractionResult(extracted, "high", "matched", len(extracted))
+
+    # Tier 2: relax the length bar, keep the TOC guard. Catches legitimately
+    # shorter risk-factor sections without accepting index-row noise.
+    start, end = _find_best_gap(clean_text, start_positions, doc_len, MIN_ACCEPTABLE_LEN, require_toc_guard=True)
+    if start is not None:
+        extracted = clean_text[start:end].strip()
+        return ExtractionResult(extracted, "low", "matched_short", len(extracted))
+
+    # Tier 3: no confirmed end anchor. Slice forward from the last start
+    # match — this is a guess, and is always tagged low confidence.
+    pos = start_positions[-1]
+    end = min(pos + MAX_SECTION_LEN, doc_len)
+    extracted = clean_text[pos:end].strip()
+    if len(extracted) < MIN_ACCEPTABLE_LEN:
+        return ExtractionResult(None, "none", "none", 0)
+    return ExtractionResult(extracted, "low", "fallback", len(extracted))
+
+
+def extract_item_1a(html_content: str) -> Optional[str]:
+    """Backward-compatible wrapper — text only, no confidence info. Prefer
+    extract_item_1a_detailed for anything that consumes the confidence tag."""
+    return extract_item_1a_detailed(html_content).text
 
 
 _WORD_RE = re.compile(r"[a-zA-Z]{2,}")
@@ -336,13 +413,26 @@ def build_panel(
     ticker_to_cik = client.fetch_company_tickers()
 
     extracted_texts: Dict[Tuple[str, int], str] = {}
+    extraction_confidence: Dict[Tuple[str, int], str] = {}
 
     for ticker in tickers:
+        diag = {
+            "cik_found": False,
+            "filings_found": 0,
+            "filings_attempted": 0,
+            "filings_downloaded": 0,
+            "filings_extracted_high": 0,
+            "filings_extracted_low": 0,
+            "filings_failed": 0,
+        }
+        stats.ticker_diagnostics[ticker] = diag
+
         cik = ticker_to_cik.get(ticker)
         if not cik:
             stats.tickers_skipped_no_cik.append(ticker)
             logger.warning("No CIK found for ticker %s, skipping.", ticker)
             continue
+        diag["cik_found"] = True
 
         try:
             filings = client.fetch_filing_index(ticker, cik)
@@ -350,24 +440,41 @@ def build_panel(
             stats.tickers_skipped_fetch_error.append((ticker, str(e)))
             logger.warning("Failed to fetch filing index for %s: %s", ticker, e)
             continue
+        diag["filings_found"] = len(filings)
 
         filings = sorted(filings, key=lambda x: x.fiscal_year)[-n_filings:]
+        diag["filings_attempted"] = len(filings)
 
         for f in filings:
             try:
                 html_data = client.download_filing_text(f.document_url)
             except Exception as e:
                 stats.filings_download_failed.append((ticker, f.fiscal_year, str(e)))
+                diag["filings_failed"] += 1
                 logger.warning(
                     "Failed to download filing for %s FY%s: %s", ticker, f.fiscal_year, e
                 )
                 continue
+            diag["filings_downloaded"] += 1
 
-            text = extract_item_1a(html_data)
-            if text:
-                extracted_texts[(ticker, f.fiscal_year)] = text
+            result = extract_item_1a_detailed(html_data)
+            if result.text:
+                extracted_texts[(ticker, f.fiscal_year)] = result.text
+                extraction_confidence[(ticker, f.fiscal_year)] = result.confidence
                 stats.firm_years_extracted += 1
+                if result.confidence == "high":
+                    diag["filings_extracted_high"] += 1
+                else:
+                    diag["filings_extracted_low"] += 1
+                    stats.firm_years_low_confidence.append(
+                        (ticker, f.fiscal_year, f"method={result.method}, len={result.char_len}")
+                    )
+                    logger.warning(
+                        "Low-confidence Item 1A extraction for %s FY%s (method=%s, len=%d).",
+                        ticker, f.fiscal_year, result.method, result.char_len,
+                    )
             else:
+                diag["filings_failed"] += 1
                 stats.filings_extraction_failed.append(
                     (ticker, f.fiscal_year, "Item 1A not found or too short")
                 )
@@ -377,6 +484,34 @@ def build_panel(
 
     if not extracted_texts:
         return pd.DataFrame(), stats
+
+    # Second-pass sanity check: even a "high" confidence extraction can be
+    # an outlier if it's much shorter than that same firm's other filings —
+    # a firm's Item 1A section doesn't swing from 40 pages to 2 pages year
+    # over year in practice, so a big length drop is itself a signal worth
+    # flagging even when the extractor was structurally confident.
+    lengths_by_ticker: Dict[str, List[int]] = {}
+    for (t, y), text in extracted_texts.items():
+        lengths_by_ticker.setdefault(t, []).append(len(text))
+
+    for t, lens in lengths_by_ticker.items():
+        if len(lens) < 2:
+            continue
+        median_len = sorted(lens)[len(lens) // 2]
+        for (tk, y), text in extracted_texts.items():
+            if tk != t:
+                continue
+            if median_len > 0 and len(text) < 0.25 * median_len:
+                key = (tk, y)
+                if extraction_confidence.get(key) == "high":
+                    extraction_confidence[key] = "low"
+                    stats.firm_years_low_confidence.append(
+                        (tk, y, f"length_outlier: {len(text)} chars vs firm median {median_len}")
+                    )
+                    logger.warning(
+                        "Flagging %s FY%s as low confidence: extracted length %d is far below "
+                        "this firm's median of %d.", tk, y, len(text), median_len,
+                    )
 
     keys = list(extracted_texts.keys())
     corpus = [extracted_texts[k] for k in keys]
@@ -400,15 +535,36 @@ def build_panel(
                 extracted_texts[(ticker, curr_yr)],
                 vectorizer,
             )
+
+            prev_conf = extraction_confidence.get((ticker, prev_yr), "high")
+            curr_conf = extraction_confidence.get((ticker, curr_yr), "high")
+            # Belt-and-suspenders: even if both extractions were confident,
+            # an extreme, structurally implausible swing (near-total token
+            # turnover year over year) is worth a second look before it's
+            # cited as a finding rather than discovered by trial and error.
+            extreme_swing = metrics["change_score"] > 0.5 and metrics["jaccard_similarity"] < 0.2
+            flagged = (prev_conf != "high") or (curr_conf != "high") or extreme_swing
+
+            flag_reasons = []
+            if prev_conf != "high":
+                flag_reasons.append(f"FY{prev_yr} extraction: {prev_conf} confidence")
+            if curr_conf != "high":
+                flag_reasons.append(f"FY{curr_yr} extraction: {curr_conf} confidence")
+            if extreme_swing:
+                flag_reasons.append("extreme year-over-year swing — verify extracted text manually")
+
             panel_rows.append({
                 "ticker": ticker,
                 "fiscal_year": curr_yr,
                 "cosine_similarity": metrics["cosine_similarity"],
                 "jaccard_similarity": metrics["jaccard_similarity"],
-                "change_score": metrics["change_score"]
+                "change_score": metrics["change_score"],
+                "flagged": flagged,
+                "flag_reason": "; ".join(flag_reasons),
             })
 
     stats.panel_rows_built = len(panel_rows)
+    stats.panel_rows_flagged = sum(1 for r in panel_rows if r["flagged"])
     return pd.DataFrame(panel_rows), stats
 
 
