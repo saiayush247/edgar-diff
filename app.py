@@ -55,10 +55,25 @@ if st.sidebar.button("Build Panel"):
             st.error(f"Pipeline failed: {e}")
             st.stop()
 
-    with st.expander("Run details (what was skipped and why)"):
+    with st.expander("Run details (what was skipped and why)", expanded=True):
         st.write(f"Tickers requested: {stats.tickers_requested}")
         st.write(f"Firm-years successfully extracted: {stats.firm_years_extracted}")
+        if stats.firm_years_low_confidence:
+            st.write(f"Firm-years extracted but flagged low confidence: {len(stats.firm_years_low_confidence)}")
         st.write(f"Panel rows built: {stats.panel_rows_built}")
+        if stats.panel_rows_flagged:
+            st.warning(
+                f"{stats.panel_rows_flagged} of {stats.panel_rows_built} panel rows are flagged "
+                f"for low-confidence extraction or an extreme year-over-year swing — see the "
+                f"flagged rows table below before treating those numbers as reliable."
+            )
+
+        if stats.ticker_diagnostics:
+            st.write("Per-ticker funnel (where each ticker succeeded or dropped out):")
+            diag_df = pd.DataFrame.from_dict(stats.ticker_diagnostics, orient="index")
+            diag_df.index.name = "ticker"
+            st.dataframe(diag_df, use_container_width=True)
+
         if stats.tickers_skipped_no_cik:
             st.write(f"Tickers with no CIK match: {stats.tickers_skipped_no_cik}")
         if stats.tickers_skipped_fetch_error:
@@ -66,7 +81,9 @@ if st.sidebar.button("Build Panel"):
         if stats.filings_download_failed:
             st.write(f"Filings that failed to download: {stats.filings_download_failed}")
         if stats.filings_extraction_failed:
-            st.write(f"Filings where Item 1A extraction failed: {stats.filings_extraction_failed}")
+            st.write(f"Filings where Item 1A extraction failed outright: {stats.filings_extraction_failed}")
+        if stats.firm_years_low_confidence:
+            st.write(f"Filings extracted but flagged low confidence (reason shown): {stats.firm_years_low_confidence}")
 
     if panel.empty:
         st.error("No panel rows were produced. Check tickers and try again — "
@@ -77,7 +94,23 @@ if st.sidebar.button("Build Panel"):
                f"{panel['ticker'].nunique()} firms.")
 
     st.subheader("Panel Dataset")
-    st.dataframe(panel, use_container_width=True)
+    display_panel = panel.copy()
+    display_panel["flagged"] = display_panel["flagged"].map({True: "⚠️ flagged", False: ""})
+    st.dataframe(display_panel, use_container_width=True)
+
+    flagged_rows = panel[panel["flagged"]]
+    if not flagged_rows.empty:
+        with st.expander(f"⚠️ {len(flagged_rows)} flagged row(s) — verify before citing", expanded=False):
+            st.caption(
+                "These rows involve a low-confidence text extraction or an extreme year-over-year "
+                "swing that doesn't match typical disclosure patterns. They're kept in the panel "
+                "rather than silently dropped, but should be spot-checked against the source filing "
+                "before being used as evidence of anything."
+            )
+            st.dataframe(
+                flagged_rows[["ticker", "fiscal_year", "change_score", "flag_reason"]],
+                use_container_width=True,
+            )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -98,13 +131,23 @@ if st.sidebar.button("Build Panel"):
         if validated.empty:
             st.warning("Validation returned no matched rows.")
         else:
-            corr = validated[["change_score", "forward_return"]].corr().iloc[0, 1]
             st.subheader("Validation: Change Score vs. Forward Return")
-            st.metric("Correlation (change_score, forward_return)", f"{corr:.3f}")
+            corr_all = validated[["change_score", "forward_return"]].corr().iloc[0, 1]
+            clean = validated[~validated["flagged"]] if "flagged" in validated.columns else validated
+            vcol1, vcol2 = st.columns(2)
+            with vcol1:
+                st.metric("Correlation, all rows", f"{corr_all:.3f}", help=f"n={len(validated)}")
+            with vcol2:
+                if len(clean) >= 3:
+                    corr_clean = clean[["change_score", "forward_return"]].corr().iloc[0, 1]
+                    st.metric("Correlation, flagged rows excluded", f"{corr_clean:.3f}", help=f"n={len(clean)}")
+                else:
+                    st.metric("Correlation, flagged rows excluded", "n/a", help="too few clean rows")
             st.scatter_chart(validated, x="change_score", y="forward_return")
             st.caption(
                 "Filing dates in this validation are approximated and the window is "
                 "fixed calendar time, not aligned to actual filing dates. Returns are "
-                "not risk-adjusted or benchmarked. Treat this as a directional check, "
-                "not a publication-grade estimate."
+                "not risk-adjusted or benchmarked. Sample size at this firm count is too "
+                "small to treat either correlation as statistically meaningful — this is "
+                "a directional check, not a publication-grade estimate."
             )
