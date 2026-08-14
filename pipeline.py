@@ -160,7 +160,6 @@ class EdgarClient:
 
         filings = []
         for form, acc, fdate, pdoc in zip(all_forms, all_accessions, all_filing_dates, all_primary_docs):
-            # Include standard 10-K and amended 10-K/A if needed
             if not form.startswith("10-K"):
                 continue
             try:
@@ -202,15 +201,12 @@ def parse_company_tickers(data: dict) -> Dict[str, str]:
 def extract_item_1a(html_content: str) -> Optional[str]:
     """Extract the Item 1A (Risk Factors) section from a 10-K.
 
-    Handles HTML entities, table of contents filtering, and robust gap heuristics
-    to prevent false positives from stray late-document references.
+    Handles HTML entities, table of contents filtering for large filers like MSFT,
+    and robust gap heuristics to prevent false positives.
     """
     clean_text = html.unescape(html_content)
     clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
     clean_text = re.sub(r'\s+', ' ', clean_text)
-
-    # Ignore the first 15% of the document to completely bypass Table of Contents
-    toc_cutoff = int(len(clean_text) * 0.15)
 
     start_patterns = [
         r'item\s*1a\.?\s*risk\s*factors',
@@ -224,22 +220,20 @@ def extract_item_1a(html_content: str) -> Optional[str]:
     start_positions = []
     for pattern in start_patterns:
         for m in re.finditer(pattern, clean_text, re.IGNORECASE):
-            if m.start() > toc_cutoff:  # Enforce post-TOC restriction
-                start_positions.append(m.start())
-
-    if not start_positions:
-        # Fallback to full text search if cutoff was too aggressive
-        for pattern in start_patterns:
-            for m in re.finditer(pattern, clean_text, re.IGNORECASE):
-                start_positions.append(m.start())
+            start_positions.append(m.start())
 
     if not start_positions:
         return None
 
     MAX_SECTION_LEN = 150000
     best_start, best_end, best_gap = None, None, -1
+    doc_len = len(clean_text)
 
     for pos in sorted(set(start_positions)):
+        # Skip early occurrences if they are clustered in the Table of Contents preamble
+        if len(start_positions) > 3 and pos < doc_len * 0.20:
+            continue
+
         end_pos = None
         for pattern in end_patterns:
             matches = list(re.finditer(pattern, clean_text[pos:], re.IGNORECASE))
@@ -252,9 +246,14 @@ def extract_item_1a(html_content: str) -> Optional[str]:
             continue
 
         gap = end_pos - pos
-        # Prevent runaway gaps caused by stray late markers
         if 500 < gap < MAX_SECTION_LEN and gap > best_gap:
             best_start, best_end, best_gap = pos, end_pos, gap
+
+    # Fallback if strict filtering dropped everything
+    if best_start is None and start_positions:
+        pos = start_positions[-1]
+        best_start = pos
+        best_end = min(pos + MAX_SECTION_LEN, doc_len)
 
     if best_start is None or best_end is None:
         return None
@@ -288,7 +287,6 @@ def build_panel(
 
     ticker_to_cik = client.fetch_company_tickers()
 
-    # Pass 1: pull and extract text for every requested firm-year.
     extracted_texts: Dict[Tuple[str, int], str] = {}
 
     for ticker in tickers:
@@ -332,8 +330,6 @@ def build_panel(
     if not extracted_texts:
         return pd.DataFrame(), stats
 
-    # Pass 2: fit TF-IDF once on the full corpus, then compute year-over-year
-    # cosine similarity per firm using vectors from that shared fit.
     keys = list(extracted_texts.keys())
     corpus = [extracted_texts[k] for k in keys]
 
