@@ -38,6 +38,18 @@ use_cache = st.sidebar.checkbox(
 run_validation = st.sidebar.checkbox(
     "Validate against forward returns (requires yfinance, slower)", value=False
 )
+if run_validation:
+    window_trading_days = st.sidebar.slider(
+        "Return window (trading days after filing)", min_value=5, max_value=63, value=21,
+        help="Holding period starts the trading day after the 10-K's actual filing date, "
+             "not a fixed calendar window — so this is aligned to when the market could "
+             "actually have reacted to the filing.",
+    )
+    benchmark_ticker = st.sidebar.text_input(
+        "Benchmark ticker (for excess return)", value="SPY",
+        help="Stock return minus benchmark return over the same window, so the "
+             "correlation isn't just picking up broad market moves.",
+    )
 
 if st.sidebar.button("Build Panel"):
     if not user_agent or "@" not in user_agent:
@@ -126,28 +138,57 @@ if st.sidebar.button("Build Panel"):
                        file_name="edgar_diff_panel.csv", mime="text/csv")
 
     if run_validation:
-        with st.spinner("Fetching forward returns via yfinance and computing correlation..."):
-            validated = validate_against_forward_returns(panel)
+        with st.spinner(f"Fetching {window_trading_days}-trading-day forward returns "
+                        f"(vs. {benchmark_ticker}) via yfinance..."):
+            try:
+                validated = validate_against_forward_returns(
+                    panel, window_trading_days=window_trading_days, benchmark_ticker=benchmark_ticker
+                )
+            except Exception as e:
+                st.error(f"Return validation failed: {e}")
+                validated = pd.DataFrame()
+
         if validated.empty:
-            st.warning("Validation returned no matched rows.")
+            st.warning("Validation returned no matched rows — this can happen if filing dates "
+                      "are too recent to have a full forward window yet, or if the ticker/"
+                      "benchmark data wasn't available for the needed range.")
         else:
             st.subheader("Validation: Change Score vs. Forward Return")
-            corr_all = validated[["change_score", "forward_return"]].corr().iloc[0, 1]
+            st.caption(
+                f"Return window: the {window_trading_days} trading days starting the day "
+                f"after each firm's actual 10-K filing date. Excess return subtracts "
+                f"{benchmark_ticker}'s return over the identical window, so it isn't just "
+                f"picking up market-wide moves that happen to coincide with filing season."
+            )
+
+            has_excess = "excess_return" in validated.columns and validated["excess_return"].notna().any()
+            metric_col = "excess_return" if has_excess else "forward_return"
+            metric_label = "excess return" if has_excess else "raw return (no benchmark data)"
+
+            corr_all = validated[["change_score", metric_col]].corr().iloc[0, 1]
             clean = validated[~validated["flagged"]] if "flagged" in validated.columns else validated
             vcol1, vcol2 = st.columns(2)
             with vcol1:
-                st.metric("Correlation, all rows", f"{corr_all:.3f}", help=f"n={len(validated)}")
+                st.metric(f"Correlation w/ {metric_label}, all rows", f"{corr_all:.3f}", help=f"n={len(validated)}")
             with vcol2:
                 if len(clean) >= 3:
-                    corr_clean = clean[["change_score", "forward_return"]].corr().iloc[0, 1]
-                    st.metric("Correlation, flagged rows excluded", f"{corr_clean:.3f}", help=f"n={len(clean)}")
+                    corr_clean = clean[["change_score", metric_col]].corr().iloc[0, 1]
+                    st.metric(f"Correlation w/ {metric_label}, flagged rows excluded",
+                             f"{corr_clean:.3f}", help=f"n={len(clean)}")
                 else:
-                    st.metric("Correlation, flagged rows excluded", "n/a", help="too few clean rows")
-            st.scatter_chart(validated, x="change_score", y="forward_return")
+                    st.metric(f"Correlation w/ {metric_label}, flagged rows excluded",
+                             "n/a", help="too few clean rows")
+            st.scatter_chart(validated, x="change_score", y=metric_col)
+
+            display_cols = ["ticker", "fiscal_year", "filing_date", "window_start", "window_end",
+                            "change_score", "forward_return", "benchmark_return", "excess_return"]
+            display_cols = [c for c in display_cols if c in validated.columns]
+            st.dataframe(validated[display_cols], use_container_width=True)
+
             st.caption(
-                "Filing dates in this validation are approximated and the window is "
-                "fixed calendar time, not aligned to actual filing dates. Returns are "
-                "not risk-adjusted or benchmarked. Sample size at this firm count is too "
-                "small to treat either correlation as statistically meaningful — this is "
-                "a directional check, not a publication-grade estimate."
+                "Not a risk-adjusted asset-pricing test — no size/value/momentum controls "
+                "beyond the single benchmark subtraction, and no handling of delisted or "
+                "acquired firms. Sample size at this firm count is far too small to treat "
+                "either correlation as statistically meaningful on its own — this is a "
+                "directional sanity check, not a publication-grade estimate."
             )
