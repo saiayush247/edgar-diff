@@ -133,11 +133,13 @@ class EdgarClient:
         accessions = recent.get("accessionNumber", [])
         filing_dates = recent.get("filingDate", [])
         primary_docs = recent.get("primaryDocument", [])
+        report_dates = recent.get("reportDate", [])
 
         all_forms = list(forms)
         all_accessions = list(accessions)
         all_filing_dates = list(filing_dates)
         all_primary_docs = list(primary_docs)
+        all_report_dates = list(report_dates)
 
         # SEC submissions API pagination for high-volume filers (JPM, XOM, etc.)
         older_files = data.get("filings", {}).get("files", [])
@@ -152,20 +154,46 @@ class EdgarClient:
                 all_accessions.extend(older_data.get("accessionNumber", []))
                 all_filing_dates.extend(older_data.get("filingDate", []))
                 all_primary_docs.extend(older_data.get("primaryDocument", []))
+                all_report_dates.extend(older_data.get("reportDate", []))
             except Exception as e:
                 logger.warning(
                     "Failed to fetch older submissions page %s for %s: %s",
                     older_url, ticker, e,
                 )
 
+        # Older paginated submission files sometimes omit reportDate entirely,
+        # or the arrays can be out of sync in length. Pad defensively so zip
+        # doesn't silently truncate and misalign the other fields.
+        n = len(all_forms)
+        if len(all_report_dates) < n:
+            all_report_dates = all_report_dates + [""] * (n - len(all_report_dates))
+
         filings = []
-        for form, acc, fdate, pdoc in zip(all_forms, all_accessions, all_filing_dates, all_primary_docs):
-            if not form.startswith("10-K"):
+        for form, acc, fdate, pdoc, rdate in zip(
+            all_forms, all_accessions, all_filing_dates, all_primary_docs, all_report_dates
+        ):
+            # Exact match only. "10-K".startswith would also match 10-K/A and
+            # 10-K405 style amendments/variants, which often only restate
+            # Part III and don't carry a full Item 1A. If you later want to
+            # accept NT 10-K or 10-K405 explicitly, add them here rather than
+            # loosening back to startswith.
+            if form != "10-K":
                 continue
-            try:
-                fy = int(fdate.split("-")[0]) - 1
-            except Exception:
-                continue
+
+            fy = None
+            if rdate:
+                try:
+                    fy = int(rdate.split("-")[0])
+                except Exception:
+                    fy = None
+            if fy is None:
+                # Fallback only when SEC didn't give us a reportDate at all.
+                # This is the old (wrong for MSFT/WMT-style fiscal calendars)
+                # heuristic — kept only as a last resort, not the default path.
+                try:
+                    fy = int(fdate.split("-")[0]) - 1
+                except Exception:
+                    continue
 
             acc_no_hyphen = acc.replace("-", "")
             doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_no_hyphen}/{pdoc}"
@@ -225,8 +253,12 @@ def extract_item_1a(html_content: str) -> Optional[str]:
     if not start_positions:
         return None
 
-    MAX_SECTION_LEN = 150000
-    best_start, best_end, best_gap = None, None, -1
+    # JPM-scale filers routinely have Item 1A sections that clean to well
+    # over 150k characters (credit/regulatory risk disclosure runs long).
+    # 150k was silently forcing the biggest filers into the unfiltered
+    # fallback path. 400k gives real headroom without being unbounded.
+    MAX_SECTION_LEN = 400000
+    best_start, best_end, best_gap = None, None, None
     doc_len = len(clean_text)
 
     for pos in sorted(set(start_positions)):
@@ -246,7 +278,7 @@ def extract_item_1a(html_content: str) -> Optional[str]:
             continue
 
         gap = end_pos - pos
-        if 500 < gap < MAX_SECTION_LEN and gap > best_gap:
+        if 500 < gap < MAX_SECTION_LEN and (best_gap is None or gap < best_gap):
             best_start, best_end, best_gap = pos, end_pos, gap
 
     # Fallback if strict filtering dropped everything
@@ -265,12 +297,28 @@ def extract_item_1a(html_content: str) -> Optional[str]:
     return extracted
 
 
-def year_over_year_similarity(prev_vec, curr_vec, prev_text: str, curr_text: str) -> dict:
+_WORD_RE = re.compile(r"[a-zA-Z]{2,}")
+
+
+def _tokenize_for_jaccard(text: str, vectorizer: TfidfVectorizer) -> set:
+    """Same lowercasing + punctuation stripping + stopword removal as the
+    TfidfVectorizer, so cosine and Jaccard are computed over the same
+    vocabulary. Previously Jaccard used raw .split() (no stopword removal,
+    "risk," != "risk"), so the two metrics disagreed about what counted as
+    a token change."""
+    stop_words = vectorizer.get_stop_words() or set()
+    tokens = _WORD_RE.findall(text.lower())
+    return {t for t in tokens if t not in stop_words}
+
+
+def year_over_year_similarity(
+    prev_vec, curr_vec, prev_text: str, curr_text: str, vectorizer: TfidfVectorizer
+) -> dict:
     """Compute change metrics between two firm-year documents."""
     sim = cosine_similarity(prev_vec, curr_vec)[0][0]
 
-    prev_tokens = set(prev_text.lower().split())
-    curr_tokens = set(curr_text.lower().split())
+    prev_tokens = _tokenize_for_jaccard(prev_text, vectorizer)
+    curr_tokens = _tokenize_for_jaccard(curr_text, vectorizer)
     jaccard = len(prev_tokens.intersection(curr_tokens)) / max(len(prev_tokens.union(curr_tokens)), 1)
 
     return {
@@ -350,6 +398,7 @@ def build_panel(
                 vectors[(ticker, curr_yr)],
                 extracted_texts[(ticker, prev_yr)],
                 extracted_texts[(ticker, curr_yr)],
+                vectorizer,
             )
             panel_rows.append({
                 "ticker": ticker,
