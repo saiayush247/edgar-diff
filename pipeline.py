@@ -1,3 +1,38 @@
+"""EDGAR 10-K disclosure-change panel builder.
+
+Builds a firm-year panel of year-over-year textual change in Item 1A
+(Risk Factors), following the general approach in the disclosure-change
+literature (e.g. Cohen, Malloy & Nguyen, "Lazy Prices," 2020): pull
+consecutive 10-Ks for a firm, extract the risk-factors section from each,
+and measure how much that section changed from one year to the next.
+
+Pipeline:
+    1. EdgarClient resolves ticker -> CIK and pulls each firm's 10-K
+       filing index from SEC's submissions API (paginating through older
+       filings for high-volume filers).
+    2. extract_item_1a_detailed() pulls the Item 1A section out of each
+       filing's raw HTML via anchor-pattern matching, and tags the result
+       with a confidence level rather than a silent pass/fail, since
+       regex-based section extraction on inconsistently formatted HTML
+       filings is not going to be 100% reliable.
+    3. build_panel() assembles firm-year pairs, computes TF-IDF cosine
+       similarity and Jaccard token overlap between consecutive years, and
+       flags rows with low-confidence extractions or structurally
+       implausible swings so they can be reviewed rather than trusted
+       blindly.
+    4. validate_against_forward_returns() is an optional, secondary sanity
+       check: it measures each firm's stock return (raw and
+       benchmark-adjusted) over a fixed trading-day window starting the
+       day after the actual filing date, for an informal look at whether
+       disclosure change correlates with subsequent stock performance.
+
+Known limitations (see README.md for the full list): section extraction
+is regex/anchor-based and not a substitute for manually verifying flagged
+rows; the return validation is a directional sanity check, not a
+risk-adjusted asset-pricing test, and the firm counts used here are far
+too small to support a statistically meaningful correlation on their own.
+"""
+
 import hashlib
 import html
 import json
@@ -138,18 +173,35 @@ class EdgarClient:
         url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
         data = json.loads(self.get_text(url))
 
-        recent = data.get("filings", {}).get("recent", {})
-        forms = recent.get("form", [])
-        accessions = recent.get("accessionNumber", [])
-        filing_dates = recent.get("filingDate", [])
-        primary_docs = recent.get("primaryDocument", [])
-        report_dates = recent.get("reportDate", [])
+        # SEC's submissions JSON is a set of parallel arrays (form[i],
+        # accessionNumber[i], filingDate[i], ... all describe filing i).
+        # Older paginated pages sometimes omit a field (usually reportDate)
+        # for just that page, so each page's arrays must be padded to that
+        # page's own length *before* concatenating pages together. Padding
+        # only once at the very end (on the concatenated arrays) does not
+        # fix this: if page 2 is short by one reportDate entry, every
+        # filing from page 2 onward silently shifts by one position and
+        # gets the wrong report date, and therefore the wrong fiscal year.
+        def _extract_page(page: dict) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
+            forms = list(page.get("form", []) or [])
+            n = len(forms)
 
-        all_forms = list(forms)
-        all_accessions = list(accessions)
-        all_filing_dates = list(filing_dates)
-        all_primary_docs = list(primary_docs)
-        all_report_dates = list(report_dates)
+            def _padded(key: str) -> List[str]:
+                vals = list(page.get(key, []) or [])
+                if len(vals) < n:
+                    vals = vals + [""] * (n - len(vals))
+                return vals[:n]
+
+            return (
+                forms,
+                _padded("accessionNumber"),
+                _padded("filingDate"),
+                _padded("primaryDocument"),
+                _padded("reportDate"),
+            )
+
+        recent = data.get("filings", {}).get("recent", {})
+        all_forms, all_accessions, all_filing_dates, all_primary_docs, all_report_dates = _extract_page(recent)
 
         # SEC submissions API pagination for high-volume filers (JPM, XOM, etc.)
         older_files = data.get("filings", {}).get("files", [])
@@ -160,23 +212,17 @@ class EdgarClient:
             older_url = f"https://data.sec.gov/submissions/{filename}"
             try:
                 older_data = json.loads(self.get_text(older_url))
-                all_forms.extend(older_data.get("form", []))
-                all_accessions.extend(older_data.get("accessionNumber", []))
-                all_filing_dates.extend(older_data.get("filingDate", []))
-                all_primary_docs.extend(older_data.get("primaryDocument", []))
-                all_report_dates.extend(older_data.get("reportDate", []))
+                p_forms, p_acc, p_fdate, p_pdoc, p_rdate = _extract_page(older_data)
+                all_forms.extend(p_forms)
+                all_accessions.extend(p_acc)
+                all_filing_dates.extend(p_fdate)
+                all_primary_docs.extend(p_pdoc)
+                all_report_dates.extend(p_rdate)
             except Exception as e:
                 logger.warning(
                     "Failed to fetch older submissions page %s for %s: %s",
                     older_url, ticker, e,
                 )
-
-        # Older paginated submission files sometimes omit reportDate entirely,
-        # or the arrays can be out of sync in length. Pad defensively so zip
-        # doesn't silently truncate and misalign the other fields.
-        n = len(all_forms)
-        if len(all_report_dates) < n:
-            all_report_dates = all_report_dates + [""] * (n - len(all_report_dates))
 
         filings = []
         for form, acc, fdate, pdoc, rdate in zip(
@@ -241,10 +287,7 @@ def parse_company_tickers(data: dict) -> Dict[str, str]:
     return mapping
 
 
-from dataclasses import dataclass as _dc
-
-
-@_dc
+@dataclass
 class ExtractionResult:
     text: Optional[str]
     confidence: str   # "high", "low", "none"
@@ -414,6 +457,7 @@ def build_panel(
 
     extracted_texts: Dict[Tuple[str, int], str] = {}
     extraction_confidence: Dict[Tuple[str, int], str] = {}
+    filing_dates: Dict[Tuple[str, int], str] = {}
 
     for ticker in tickers:
         diag = {
@@ -461,6 +505,7 @@ def build_panel(
             if result.text:
                 extracted_texts[(ticker, f.fiscal_year)] = result.text
                 extraction_confidence[(ticker, f.fiscal_year)] = result.confidence
+                filing_dates[(ticker, f.fiscal_year)] = f.filing_date
                 stats.firm_years_extracted += 1
                 if result.confidence == "high":
                     diag["filings_extracted_high"] += 1
@@ -490,28 +535,28 @@ def build_panel(
     # a firm's Item 1A section doesn't swing from 40 pages to 2 pages year
     # over year in practice, so a big length drop is itself a signal worth
     # flagging even when the extractor was structurally confident.
-    lengths_by_ticker: Dict[str, List[int]] = {}
-    for (t, y), text in extracted_texts.items():
-        lengths_by_ticker.setdefault(t, []).append(len(text))
+    keys_by_ticker: Dict[str, List[Tuple[str, int]]] = {}
+    for key in extracted_texts.keys():
+        keys_by_ticker.setdefault(key[0], []).append(key)
 
-    for t, lens in lengths_by_ticker.items():
+    for t, ticker_keys in keys_by_ticker.items():
+        lens = [len(extracted_texts[k]) for k in ticker_keys]
         if len(lens) < 2:
             continue
         median_len = sorted(lens)[len(lens) // 2]
-        for (tk, y), text in extracted_texts.items():
-            if tk != t:
-                continue
-            if median_len > 0 and len(text) < 0.25 * median_len:
-                key = (tk, y)
-                if extraction_confidence.get(key) == "high":
-                    extraction_confidence[key] = "low"
-                    stats.firm_years_low_confidence.append(
-                        (tk, y, f"length_outlier: {len(text)} chars vs firm median {median_len}")
-                    )
-                    logger.warning(
-                        "Flagging %s FY%s as low confidence: extracted length %d is far below "
-                        "this firm's median of %d.", tk, y, len(text), median_len,
-                    )
+        if median_len <= 0:
+            continue
+        for key in ticker_keys:
+            text_len = len(extracted_texts[key])
+            if text_len < 0.25 * median_len and extraction_confidence.get(key) == "high":
+                extraction_confidence[key] = "low"
+                stats.firm_years_low_confidence.append(
+                    (key[0], key[1], f"length_outlier: {text_len} chars vs firm median {median_len}")
+                )
+                logger.warning(
+                    "Flagging %s FY%s as low confidence: extracted length %d is far below "
+                    "this firm's median of %d.", key[0], key[1], text_len, median_len,
+                )
 
     keys = list(extracted_texts.keys())
     corpus = [extracted_texts[k] for k in keys]
@@ -556,6 +601,7 @@ def build_panel(
             panel_rows.append({
                 "ticker": ticker,
                 "fiscal_year": curr_yr,
+                "filing_date": filing_dates.get((ticker, curr_yr)),
                 "cosine_similarity": metrics["cosine_similarity"],
                 "jaccard_similarity": metrics["jaccard_similarity"],
                 "change_score": metrics["change_score"],
@@ -568,29 +614,146 @@ def build_panel(
     return pd.DataFrame(panel_rows), stats
 
 
-def validate_against_forward_returns(panel_df: pd.DataFrame) -> pd.DataFrame:
+def _trading_day_return(
+    history: pd.DataFrame, event_date: pd.Timestamp, window_trading_days: int
+) -> Optional[Tuple[float, str, str]]:
+    """Return (pct_return, window_start_date, window_end_date) for holding
+    from the first trading day strictly after `event_date` through
+    `window_trading_days` trading days later, using `history` (a
+    DatetimeIndex-ed frame with a 'Close' column).
+
+    Returns None if there isn't a full window available (e.g. the filing
+    is too recent, or the ticker has no data in range) rather than
+    silently truncating the window, since a truncated window is not
+    comparable across rows.
+    """
+    if history.empty or pd.isna(event_date):
+        return None
+
+    idx = history.index
+    start_pos = idx.searchsorted(event_date, side="right")
+    if start_pos >= len(idx):
+        return None
+    end_pos = start_pos + window_trading_days
+    if end_pos >= len(idx):
+        return None
+
+    start_price = history["Close"].iloc[start_pos]
+    end_price = history["Close"].iloc[end_pos]
+    if pd.isna(start_price) or pd.isna(end_price) or start_price == 0:
+        return None
+
+    ret = (end_price - start_price) / start_price
+    return float(ret), str(idx[start_pos].date()), str(idx[end_pos].date())
+
+
+def validate_against_forward_returns(
+    panel_df: pd.DataFrame,
+    window_trading_days: int = 21,
+    benchmark_ticker: str = "SPY",
+) -> pd.DataFrame:
+    """Event-study-style validation of the disclosure-change panel.
+
+    For each panel row, measures the stock's raw return and its return in
+    excess of a market benchmark over a fixed trading-day window starting
+    the day after the 10-K was actually filed (`filing_date`), then leaves
+    it to the caller to correlate that against `change_score`.
+
+    This intentionally does NOT use a calendar window like "March through
+    June of the fiscal year" — that has no necessary relationship to when
+    the filing actually happened, so a correlation computed that way could
+    just reflect market-wide moves that coincide with filing season rather
+    than any reaction to the filing itself. Subtracting the benchmark
+    return over the identical window also means the correlation isn't
+    purely picking up market beta.
+
+    Still not a rigorous asset-pricing test: no size/value/momentum risk
+    adjustment beyond the single benchmark subtraction, no handling of
+    delisted or acquired firms, and the firm counts used in this app are
+    far too small for the resulting correlation to be statistically
+    meaningful on their own — treat it as a directional sanity check, not
+    a result to report on its own.
+
+    Parameters
+    ----------
+    panel_df : output of build_panel(); must contain 'filing_date'.
+    window_trading_days : holding period length, in trading days, starting
+        the day after filing_date.
+    benchmark_ticker : ticker used as the market benchmark for excess
+        returns (default SPY).
+    """
     try:
         import yfinance as yf
     except ImportError:
+        logger.warning("yfinance is not installed; skipping forward-return validation.")
         return pd.DataFrame()
 
-    validated_rows = []
-    for _, row in panel_df.iterrows():
-        ticker = row["ticker"]
-        fy = int(row["fiscal_year"])
+    if panel_df.empty:
+        return pd.DataFrame()
+    if "filing_date" not in panel_df.columns:
+        raise ValueError(
+            "panel_df has no 'filing_date' column. Rebuild the panel with "
+            "the current build_panel(), which carries filing_date through "
+            "for each row so returns can be aligned to the real event date."
+        )
 
+    df = panel_df.copy()
+    df["filing_date"] = pd.to_datetime(df["filing_date"], errors="coerce")
+    df = df.dropna(subset=["filing_date"])
+    if df.empty:
+        return pd.DataFrame()
+
+    # Trading days skip weekends/holidays, so a `window_trading_days`-day
+    # hold needs noticeably more than that many calendar days of buffer.
+    calendar_buffer = pd.Timedelta(days=window_trading_days * 2 + 15)
+    global_start = df["filing_date"].min() - pd.Timedelta(days=5)
+    global_end = df["filing_date"].max() + calendar_buffer
+
+    try:
+        bench_hist = yf.Ticker(benchmark_ticker).history(start=global_start, end=global_end)
+        if not bench_hist.empty:
+            bench_hist.index = bench_hist.index.tz_localize(None)
+    except Exception as e:
+        logger.warning("Failed to fetch benchmark %s: %s", benchmark_ticker, e)
+        bench_hist = pd.DataFrame()
+
+    validated_rows = []
+    # Fetch each ticker's price history once (covering every filing_date it
+    # needs), not once per row — far fewer yfinance calls and less exposure
+    # to rate limiting than the previous per-row fetch.
+    for ticker, group in df.groupby("ticker"):
+        t_start = group["filing_date"].min() - pd.Timedelta(days=5)
+        t_end = group["filing_date"].max() + calendar_buffer
         try:
-            stock = yf.Ticker(ticker)
-            start_date = f"{fy}-03-01"
-            end_date = f"{fy}-06-01"
-            hist = stock.history(start=start_date, end=end_date)
-            if not hist.empty:
-                ret = (hist["Close"].iloc[-1] - hist["Close"].iloc[0]) / hist["Close"].iloc[0]
-                row_dict = row.to_dict()
-                row_dict["forward_return"] = float(ret)
-                validated_rows.append(row_dict)
+            stock_hist = yf.Ticker(ticker).history(start=t_start, end=t_end)
         except Exception as e:
-            logger.warning("Forward-return fetch failed for %s FY%s: %s", ticker, fy, e)
+            logger.warning("Forward-return fetch failed for %s: %s", ticker, e)
             continue
+        if stock_hist.empty:
+            continue
+        stock_hist.index = stock_hist.index.tz_localize(None)
+
+        for _, row in group.iterrows():
+            event_date = row["filing_date"]
+            stock_result = _trading_day_return(stock_hist, event_date, window_trading_days)
+            if stock_result is None:
+                continue
+            stock_ret, window_start, window_end = stock_result
+
+            bench_ret = None
+            if not bench_hist.empty:
+                bench_result = _trading_day_return(bench_hist, event_date, window_trading_days)
+                if bench_result is not None:
+                    bench_ret = bench_result[0]
+            excess_ret = (stock_ret - bench_ret) if bench_ret is not None else None
+
+            row_dict = row.to_dict()
+            row_dict["filing_date"] = str(event_date.date())
+            row_dict["forward_return"] = stock_ret
+            row_dict["benchmark_return"] = bench_ret
+            row_dict["excess_return"] = excess_ret
+            row_dict["window_start"] = window_start
+            row_dict["window_end"] = window_end
+            validated_rows.append(row_dict)
 
     return pd.DataFrame(validated_rows)
